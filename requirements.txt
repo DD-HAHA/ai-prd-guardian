@@ -1,3 +1,5 @@
 openai
 python-dotenv
 streamlit
+pydantic>=2.0
+pytest
