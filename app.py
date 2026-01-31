@@ -1,10 +1,43 @@
 import streamlit as st
-import os
+import json
+import re
 from openai import OpenAI
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field
 
 # 加载环境变量
 load_dotenv()
+
+# ================= Pydantic Schema =================
+
+class Finding(BaseModel):
+    id: str
+    title: str
+    severity: str  # P0 / P1 / P2
+    rationale: str
+
+class Advice(BaseModel):
+    for_pm: str
+    for_eng: str
+
+class PanelItem(BaseModel):
+    role: str
+    findings: list[Finding]
+    advice: Advice
+    score: int = Field(ge=0, le=100)
+
+class ExecSummary(BaseModel):
+    total_score: int = Field(ge=0, le=100)
+    blockers: list[str]
+    decision: str
+    items: list[PanelItem]
+    revision_blocks: list[str] = Field(default_factory=list, description="可复制到 PRD 的修订段落")
+
+# 单角色评审输出（LLM 返回后解析为 PanelItem）
+class RoleReviewOutput(BaseModel):
+    findings: list[Finding]
+    advice: Advice
+    score: int = Field(ge=0, le=100)
 
 # ================= 配置区 =================
 st.set_page_config(page_title="AI PRD 卫士 Pro", page_icon="🛡️", layout="wide")
@@ -32,76 +65,120 @@ ROLES = {
 def get_client(api_key):
     return OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
 
+ROLE_OUTPUT_JSON_SCHEMA = """
+你必须只输出一个合法 JSON 对象，不要包含 markdown 代码块或其它文字。格式如下：
+{
+  "findings": [
+    { "id": "f1", "title": "问题点专业描述", "severity": "P0或P1或P2", "rationale": "风险与原因说明" }
+  ],
+  "advice": { "for_pm": "PM 可复制到 PRD 的修订描述", "for_eng": "给开发的技术建议" },
+  "score": 85
+}
+若无问题：findings 为空数组 []，advice 可为空字符串，score 为 0-100。
+"""
+
 def agent_review(client, prd_content, role_key):
     role = ROLES[role_key]
-    prompt = f"""
-    你现在是公司的 {role['name']}。你的性格是：{role['style']}
-    
-    任务：审查 PRD，只关注：【{role['focus']}】。
-    
-    【输出要求】
-    对于发现的每一个漏洞，按此 Markdown 格式输出：
-    1. **🛑 问题点**: [专业术语描述，如'缺乏幂等性']
-       - **😟 风险**: [通俗解释后果，如'用户点一次可能被扣两次钱']
-       - **💡 建议 (技术侧)**: [给开发的建议，如'使用Redis锁']
-       - **📝 建议 (PM侧)**: [请直接给出一段可以让 PM 复制粘贴补充到 PRD 里的描述。例如：'后端需增加防重校验，同一订单号仅允许扣款一次。']
-       
-    无问题回复 "LGTM"。
-    """
-    # ... (后续代码不变)
+    system = f"""你是公司的 {role['name']}。性格：{role['style']}
+任务：审查 PRD，只关注【{role['focus']}】。
+{ROLE_OUTPUT_JSON_SCHEMA}"""
 
     try:
         response = client.chat.completions.create(
             model="deepseek-chat",
             messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": f"请审查：\n{prd_content}"}
+                {"role": "system", "content": system},
+                {"role": "user", "content": f"请审查以下 PRD，仅输出上述格式的 JSON：\n\n{prd_content}"}
             ],
-            temperature=0.4
+            temperature=0.4,
+            response_format={"type": "json_object"}
         )
-        return response.choices[0].message.content
+        raw = response.choices[0].message.content
+        # 去除可能的 markdown 代码块
+        if "```" in raw:
+            raw = re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`")
+        data = json.loads(raw)
+        out = RoleReviewOutput(**data)
+        return PanelItem(role=role_key, findings=out.findings, advice=out.advice, score=out.score)
     except Exception as e:
-        return f"❌ {role['name']} 离线: {e}"
+        return PanelItem(
+            role=role_key,
+            findings=[Finding(id="err", title="解析失败", severity="P0", rationale=str(e))],
+            advice=Advice(for_pm="", for_eng=""),
+            score=0
+        )
 
-def generate_final_report(client, prd_content, reviews):
-    reviews_text = "\n".join([f"=== {ROLES[r]['name']} 意见 ===\n{c}" for r, c in reviews.items()])
-    
-    system_prompt = """
-    你是拥有20年经验的产品VP。你需要汇总各方（CTO/UX/QA）的评审意见，输出一份最终的【PRD 评审决议】。
-    
-    要求：
-    1. **去重与清洗**：合并相似观点。
-    2. **管理决策**：对于冲突意见，给出权衡后的决策。
-    3. **输出结构**：
-       - 📊 **评分卡**：打分 (0-100)，评级 (P0-P2)。
-       - 🛑 **阻断性问题 (Must Fix)**：上线前必须解决的。
-       - ⚠️ **优化建议 (Should Fix)**：建议迭代优化的。
-       - ✅ **通过项**：做得好的地方。
-    """
-    
-    response = client.chat.completions.create(
-        model="deepseek-chat",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"原始 PRD:\n{prd_content}\n\n评审记录:\n{reviews_text}"}
-        ],
-        temperature=0.2
-    )
-    return response.choices[0].message.content
+EXEC_SUMMARY_JSON_SCHEMA = """
+你必须只输出一个合法 JSON 对象，不要包含 markdown 代码块或其它文字。格式如下：
+{
+  "total_score": 78,
+  "blockers": ["阻断项1描述", "阻断项2描述"],
+  "decision": "执行摘要：一段话总结是否通过、主要结论与决策。",
+  "items": [
+    { "role": "CTO", "findings": [...], "advice": { "for_pm": "", "for_eng": "" }, "score": 80 },
+    ...
+  ],
+  "revision_blocks": ["可直接复制到 PRD 的修订段落1", "修订段落2"]
+}
+blockers：上线前必须解决的问题列表。revision_blocks：从各角色 advice.for_pm 提炼的可复制修订块，去重合并。
+"""
 
-def format_full_report(final_report, reviews):
-    # 拼接最终报告
-    md_content = final_report + "\n\n---\n\n# 💬 评审团详细记录 (Detailed Logs)\n\n"
-    for role_key, content in reviews.items():
-        role_name = ROLES[role_key]['name']
-        md_content += f"## {role_name}\n\n{content}\n\n"
-    return md_content
+def generate_final_report(client, prd_content, panel_items: list[PanelItem]):
+    reviews_text = "\n".join([
+        f"=== {ROLES[p.role]['name']} === score={p.score}\nfindings={[f.model_dump() for f in p.findings]}\nadvice={p.advice.model_dump()}"
+        for p in panel_items
+    ])
+    system = f"""你是拥有20年经验的产品VP。汇总各方评审意见，输出最终的 PRD 评审决议（去重、合并、给出管理决策）。
+{EXEC_SUMMARY_JSON_SCHEMA}"""
+    user_content = f"原始 PRD:\n{prd_content}\n\n评审结构化记录:\n{reviews_text}"
+
+    try:
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_content}
+            ],
+            temperature=0.2,
+            response_format={"type": "json_object"}
+        )
+        raw = response.choices[0].message.content
+        if "```" in raw:
+            raw = re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`")
+        data = json.loads(raw)
+        return ExecSummary(**data)
+    except Exception as e:
+        return ExecSummary(
+            total_score=0,
+            blockers=[f"VP 汇总解析失败: {e}"],
+            decision="无法生成执行摘要。",
+            items=[PanelItem(role=p.role, findings=p.findings, advice=p.advice, score=p.score) for p in panel_items],
+            revision_blocks=[]
+        )
+
+def format_full_report_md(summary: ExecSummary, panel_items: list[PanelItem]) -> str:
+    md = f"# 执行摘要\n\n{summary.decision}\n\n"
+    md += f"**总分**: {summary.total_score}/100\n\n"
+    md += "## 阻断项 (Must Fix)\n\n"
+    for b in summary.blockers:
+        md += f"- {b}\n"
+    md += "\n## 可复制修订块\n\n"
+    for i, block in enumerate(summary.revision_blocks, 1):
+        md += f"{i}. {block}\n\n"
+    md += "\n---\n\n# 评审团详细记录\n\n"
+    for p in panel_items:
+        md += f"## {ROLES[p.role]['name']} (评分: {p.score})\n\n"
+        for f in p.findings:
+            md += f"- **{f.title}** [{f.severity}] {f.rationale}\n"
+        md += f"\n- PM 修订建议: {p.advice.for_pm}\n"
+        md += f"- 技术建议: {p.advice.for_eng}\n\n"
+    return md
 
 # ================= Session State =================
-if 'reviews' not in st.session_state:
-    st.session_state.reviews = {}
-if 'final_report' not in st.session_state:
-    st.session_state.final_report = ""
+if "panel_items" not in st.session_state:
+    st.session_state.panel_items = []
+if "exec_summary" not in st.session_state:
+    st.session_state.exec_summary = None  # ExecSummary | None
 
 # ================= 界面 UI =================
 st.title("🛡️ AI PRD Guardian Pro")
@@ -127,34 +204,34 @@ if uploaded_file and api_key:
             st.warning("请至少选择一位评审员！")
         else:
             client = get_client(api_key)
-            st.session_state.reviews = {}
-            
-            # 1. 并行评审
+            st.session_state.panel_items = []
+            st.session_state.exec_summary = None
+
             progress_bar = st.progress(0)
             status_text = st.empty()
             step = 1.0 / (len(selected_roles) + 1)
             current_progress = 0.0
-            
+
             for role in selected_roles:
                 status_text.markdown(f"**{ROLES[role]['name']}** 正在阅读文档...")
-                review = agent_review(client, prd_content, role)
-                st.session_state.reviews[role] = review
+                panel_item = agent_review(client, prd_content, role)
+                st.session_state.panel_items.append(panel_item)
                 current_progress += step
-                progress_bar.progress(current_progress)
-            
-            # 2. 汇总
+                progress_bar.progress(min(1.0, current_progress))
+
             status_text.markdown("✍️ **VP** 正在撰写最终决议...")
-            final_report = generate_final_report(client, prd_content, st.session_state.reviews)
-            st.session_state.final_report = final_report
-            progress_bar.progress(100)
+            summary = generate_final_report(client, prd_content, st.session_state.panel_items)
+            st.session_state.exec_summary = summary
+            progress_bar.progress(1.0)
             status_text.success("✅ 评审完成！")
 
 # ================= 结果展示区 =================
-if st.session_state.final_report:
+summary = st.session_state.exec_summary
+panel_items = st.session_state.panel_items
+
+if summary is not None and panel_items:
     st.divider()
-    
-    full_report_md = format_full_report(st.session_state.final_report, st.session_state.reviews)
-    
+    full_report_md = format_full_report_md(summary, panel_items)
     st.download_button(
         label="📥 下载完整评审报告 (Markdown)",
         data=full_report_md,
@@ -162,12 +239,45 @@ if st.session_state.final_report:
         mime="text/markdown"
     )
 
-    tab1, tab2 = st.tabs(["📊 最终决议", "💬 详细记录"])
-    with tab1: st.markdown(st.session_state.final_report)
+    # 执行摘要 + 评分
+    st.subheader("📊 执行摘要")
+    st.markdown(summary.decision)
+    st.metric("总分", f"{summary.total_score}/100")
+
+    # 阻断项
+    st.subheader("🛑 阻断项 (Must Fix)")
+    if summary.blockers:
+        for b in summary.blockers:
+            st.markdown(f"- {b}")
+    else:
+        st.success("无阻断项")
+
+    # 可复制修订块
+    st.subheader("📝 可复制修订块")
+    if summary.revision_blocks:
+        for i, block in enumerate(summary.revision_blocks, 1):
+            st.text_area(f"修订块 {i}（可复制）", value=block, height=80, key=f"rev_{i}")
+    else:
+        st.caption("无提炼的修订块")
+
+    tab1, tab2 = st.tabs(["📊 评分卡与决议", "💬 各角色详细记录"])
+    with tab1:
+        st.markdown("**各角色评分**")
+        cols = st.columns(min(len(summary.items), 3))
+        for i, it in enumerate(summary.items):
+            with cols[i % len(cols)]:
+                st.metric(ROLES.get(it.role, {}).get("name", it.role), f"{it.score}/100")
+        st.markdown("**决议**")
+        st.markdown(summary.decision)
     with tab2:
-        for role, review in st.session_state.reviews.items():
-            with st.expander(f"{ROLES[role]['name']} 的详细意见", expanded=True):
-                st.markdown(review)
+        for p in panel_items:
+            with st.expander(f"{ROLES[p.role]['name']} — 评分: {p.score}", expanded=True):
+                for f in p.findings:
+                    st.markdown(f"**{f.title}** `[{f.severity}]` {f.rationale}")
+                if p.advice.for_pm:
+                    st.markdown(f"**PM 修订**: {p.advice.for_pm}")
+                if p.advice.for_eng:
+                    st.markdown(f"**技术建议**: {p.advice.for_eng}")
 
 elif not api_key:
     st.info("👈 请在左侧输入 API Key 以开始。")
